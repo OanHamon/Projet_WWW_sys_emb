@@ -1,107 +1,220 @@
-#include <ChainableLED.h> // https://github.com/pjpmarques/ChainableLED
 #include <Wire.h>
-#include "DS1307.h" // https://github.com/Seeed-Studio/RTC_DS1307
+#include "DS1307.h"
 #include <Adafruit_Sensor.h>
-#include <Adafruit_BME280.h> // https://github.com/adafruit/Adafruit_BME280_Library
+#include <Adafruit_BME280.h>
 #include <SoftwareSerial.h>
+#include <LedManager.h>
 
-// GPS sur broches 4 (RX) et 5 (TX)
-SoftwareSerial gpsSerial(4, 5); // RX, TX
+// --- Définition des broches ---
+#define  BTN_ROUGE  2
+#define BTN_VERT  3
 
-// Définir les ports utilisés
-const int buttonPinRouge = 2;
-const int buttonPinVert = 3;
+// --- Objets matériels ---
+LedManager ledManager(7, 8, 1);
+SoftwareSerial gpsSerial(4, 5);
+Adafruit_BME280 bme;
 
-DS1307 clock;
-ChainableLED led(7, 8, 1);
-Adafruit_BME280 bme; // Utilisation en I2C
+// --- Modes de fonctionnement ---
+enum Mode : uint8_t {
+  MODE_ETEINT,
+  MODE_STANDARD,
+  MODE_CONFIG,
+  MODE_MAINTENANCE,
+  MODE_ECO
+};
 
-void printTime() {
-  clock.getTime();
-  Serial.print(clock.hour, DEC); Serial.print(":");
-  Serial.print(clock.minute, DEC); Serial.print(":");
-  Serial.print(clock.second, DEC); Serial.print("  ");
-  Serial.print(clock.month, DEC); Serial.print("/");
-  Serial.print(clock.dayOfMonth, DEC); Serial.print("/");
-  Serial.print(clock.year + 2000, DEC); Serial.println("");
-}
+struct ModeInfo {
+  uint8_t r, g, b;
+  const char* msg;
+};
 
-void setupTime() {
-  clock.fillByYMD(2025, 10, 8);
-  clock.fillByHMS(15, 59, 00);
-  clock.setTime();
-}
+const ModeInfo modeInfo[] = {
+  {0, 0, 0,   "Mode Veille (LED éteinte)"},
+  {0, 255, 0, "Mode Standard actif"},
+  {255, 255, 0, "Mode Configuration actif (3 min max)"},
+  {255, 165, 0, "Mode Maintenance actif"},
+  {0, 0, 255, "Mode Économique actif"}
+};
 
+// --- Variables globales ---
+Mode mode = MODE_ETEINT;
+Mode previousMode = MODE_STANDARD;
+
+unsigned long modeStart = 0;
+unsigned long timer_rougeStart = 0;
+unsigned long timer_vertStart  = 0;
+bool rougeHeldActionDone = false;
+bool vertHeldActionDone  = false;
+
+volatile unsigned int secondesEcoulees = 0;
+volatile unsigned int secondesData = 0;
+volatile bool retourAutoFlag = false;
+volatile bool aquireDataFlag = false;
+volatile bool skipNextAcq = false;
+
+const unsigned int TEMPS_RETOUR_AUTO_CONFIG = 1800;
+const unsigned int LOG_INTERVAL = 10;
+
+// --- Prototypes ---
+void initPins();
+void setMode(Mode newMode);
+void handleModeChange();
+void handleLongPress(int pin, unsigned long &timerStart, bool &heldDone, void (*callback)());
+void handleDataAcquisition();
+void configTimer1();
+void aquireData();
+String Lecture_GPS();
+
+// --- Initialisation ---
 void setup() {
-  pinMode(buttonPinRouge, INPUT);
-  pinMode(buttonPinVert, INPUT);
+  initPins();
   Serial.begin(9600);
-  gpsSerial.begin(9600); // Initialisation GPS
-  led.setColorRGB(0, 0, 0, 0);
-  clock.begin();
-  setupTime();
+  gpsSerial.begin(9600);
+  ledManager.Init_Led();
 
-  // Initialisation du capteur BME280
   if (!bme.begin(0x76)) {
     Serial.println("Erreur : capteur BME280 non détecté !");
-    while (1);
+    ledManager.feedback(ERROR_SENSOR_ACCESS);
+    while (1) ledManager.update();
+  }
+
+  configTimer1();
+  setMode(MODE_ETEINT);
+  Serial.println("Système en veille - attendre appui bouton");
+}
+
+// --- Boucle principale ---
+void loop() {
+  ledManager.update();
+  handleModeChange();
+
+  if (mode == MODE_ETEINT) {
+    if (digitalRead(BTN_ROUGE) == LOW) {
+      Serial.println("Appui sur ROUGE → démarrage en mode CONFIG");
+      setMode(MODE_CONFIG);
+    }
+    else if (digitalRead(BTN_VERT) == LOW) {
+      Serial.println("Appui sur VERT → démarrage en mode STANDARD");
+      setMode(MODE_STANDARD);
+    }
+    return;
+  }
+
+  if (retourAutoFlag) {
+    retourAutoFlag = false;
+    Serial.println("Fin mode configuration -> retour Standard");
+    setMode(MODE_STANDARD);
+  }
+
+  if (aquireDataFlag && (mode != MODE_CONFIG && mode != MODE_ETEINT))
+    handleDataAcquisition();
+}
+
+// --- Gestion des boutons longs ---
+void handleModeChange() {
+  handleLongPress(BTN_ROUGE, timer_rougeStart, rougeHeldActionDone, [](){
+    if (mode == MODE_MAINTENANCE) setMode(previousMode);
+    else { previousMode = mode; setMode(MODE_MAINTENANCE); }
+  });
+
+  handleLongPress(BTN_VERT, timer_vertStart, vertHeldActionDone, [](){
+    if (mode == MODE_ECO) setMode(MODE_STANDARD);
+    else if (mode == MODE_STANDARD) setMode(MODE_ECO);
+  });
+}
+
+void handleLongPress(int pin, unsigned long &timerStart, bool &heldDone, void (*callback)()) {
+  unsigned long now = millis();
+  if (digitalRead(pin) == LOW) {
+    if (timerStart == 0) timerStart = now;
+    if (!heldDone && (now - timerStart > 5000)) {
+      heldDone = true;
+      callback();
+    }
+  } else {
+    timerStart = 0;
+    heldDone = false;
   }
 }
 
-String Lecture_GPS(){
-  String gpsData = "";
-  if (gpsSerial.available()) {
-    bool t = true;
-    while (t) {
-      gpsData = gpsSerial.readStringUntil('\n');
-      if (gpsData.startsWith("$GPGGA")) {
-        t = false;
+// --- Changement de mode ---
+void setMode(Mode newMode) {
+  mode = newMode;
+  modeStart = millis();
+  secondesEcoulees = 0;
+  secondesData = 0;
+
+  const ModeInfo& info = modeInfo[newMode];
+  ledManager.setColor(info.r, info.g, info.b);
+  Serial.println(info.msg);
+
+  if (newMode == MODE_MAINTENANCE) {
+    Serial.print("Retournera sur ");
+    Serial.println(previousMode == MODE_ECO ? "ECO" : "STANDARD");
+  }
+}
+
+void initPins() {
+  pinMode(BTN_ROUGE, INPUT_PULLUP);
+  pinMode(BTN_VERT, INPUT_PULLUP);
+}
+
+// --- Gestion du timer ---
+void configTimer1() {
+  noInterrupts();
+  TCCR1A = 0;
+  TCCR1B = 0;
+  TCNT1  = 0;
+  OCR1A = 15624;               // 1 seconde à 16 MHz / 1024 prescaler
+  TCCR1B |= (1 << WGM12);
+  TCCR1B |= (1 << CS12) | (1 << CS10);
+  TIMSK1 |= (1 << OCIE1A);
+  interrupts();
+}
+
+ISR(TIMER1_COMPA_vect) {
+  if (mode == MODE_ETEINT) return;
+
+  if (mode == MODE_CONFIG) {
+    if (++secondesEcoulees >= TEMPS_RETOUR_AUTO_CONFIG) {
+      secondesEcoulees = 0;
+      retourAutoFlag = true;
+    }
+  } else {
+    int wait_value = (mode == MODE_ECO || (mode == MODE_MAINTENANCE && previousMode == MODE_ECO)) ? LOG_INTERVAL * 2 : LOG_INTERVAL;
+    if (++secondesData >= wait_value) {
+      secondesData = 0;
+      if (mode == MODE_ECO || (mode == MODE_MAINTENANCE && previousMode == MODE_ECO)) {
+        skipNextAcq = !skipNextAcq;
+        if (!skipNextAcq) aquireDataFlag = true;
+      } else {
+        aquireDataFlag = true;
       }
     }
-    return gpsData;
-    /*
-$GPGGA : Type de trame (Global Positioning System Fix Data).
-120937.000 : Heure UTC (12:09:37.000).
-4716.6952,N : Latitude (47° 16.6952' Nord).
-00212.7405,W : Longitude (2° 12.7405' Ouest).
-1 : Qualité du signal GPS :
-  0 = pas de position
-  1 = GPS fixe
-  2 = DGPS fixe
-9 : Nombre de satellites utilisés.
-1.01 : Précision horizontale (HDOP).
--4.4,M : Altitude au-dessus du niveau de la mer (-4.4 mètres).
-49.1,M : Hauteur du géoïde (différence entre le niveau de la mer et l’ellipsoïde WGS84).
-Champ vide : Temps de correction DGPS (non utilisé ici).
-Champ vide : ID de station DGPS (non utilisé ici).
-*63 : Somme de contrôle (checksum).*/
   }
 }
 
-void loop() {
-  // Lecture des boutons
-  int buttonStateRouge = digitalRead(buttonPinRouge);
-  int buttonStateVert = digitalRead(buttonPinVert);
-  led.setColorRGB(0, 255 * (-(buttonStateRouge - 1)), 255 * (-(buttonStateVert - 1)), 0);
+// --- Acquisition des données ---
+void handleDataAcquisition() {
+  aquireDataFlag = false;
+  Serial.println(mode == MODE_MAINTENANCE ? "data in serial port" : "data saved in SD card");
+  aquireData();
+}
 
-  // Capteur de lumière
+void aquireData() {
   int lightSensor = analogRead(A0);
-
-  // Affichage des états
-  Serial.print("Bouton Rouge : "); Serial.println(buttonStateRouge);
-  Serial.print("Bouton Vert : "); Serial.println(buttonStateVert);
+  Serial.println(Lecture_GPS());
   Serial.print("Lumière : "); Serial.println(lightSensor);
-
-  // Capteur BME280
   Serial.print("Température : "); Serial.print(bme.readTemperature()); Serial.println(" °C");
   Serial.print("Humidité : "); Serial.print(bme.readHumidity()); Serial.println(" %");
   Serial.print("Pression : "); Serial.print(bme.readPressure() / 100.0F); Serial.println(" hPa");
+}
 
-  // Lecture GPS : attend une phrase GPGGA
-  Serial.println(Lecture_GPS());
-
-  // Affichage de l'heure
-  printTime();
-
-  delay(1000);
+// --- Lecture GPS ---
+String Lecture_GPS() {
+  while (gpsSerial.available()) {
+    String line = gpsSerial.readStringUntil('\n');
+    if (line.startsWith("$GPGGA")) return line;
+  }
+  return "No GPS data";
 }
